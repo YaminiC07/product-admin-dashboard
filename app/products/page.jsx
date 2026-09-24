@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 
@@ -18,50 +18,85 @@ import {
   deleteProduct,
 } from "../../services/productService";
 
-export default function ProductsPage() {
+function ProductsPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const requestId = useRef(0);
+
+  const pageFromURL = Number(searchParams.get("page"));
+  const limitFromURL = Number(searchParams.get("limit"));
+  const searchFromURL = searchParams.get("search") || "";
 
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
+  const [total, setTotal] = useState(0);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
 
-  const [search, setSearch] = useState(
-    searchParams.get("search") || ""
-  );
-
+  const [search, setSearch] = useState(searchFromURL);
+  const [debouncedSearch, setDebouncedSearch] = useState(searchFromURL);
   const [category, setCategory] = useState(
     searchParams.get("category") || ""
   );
-
-  const [sort, setSort] = useState(
-    searchParams.get("sort") || ""
-  );
-
+  const [sort, setSort] = useState(searchParams.get("sort") || "");
   const [order, setOrder] = useState(
     searchParams.get("order") || "asc"
   );
 
-  const pageParam = Number(searchParams.get("page"));
-  const limitParam = Number(searchParams.get("limit"));
-
   const [page, setPage] = useState(
-    Number.isInteger(pageParam) && pageParam > 0
-      ? pageParam
+    Number.isInteger(pageFromURL) && pageFromURL > 0
+      ? pageFromURL
       : 1
   );
 
   const [limit, setLimit] = useState(
-    [10, 20, 50].includes(limitParam)
-      ? limitParam
-      : 10
+    [10, 20, 50].includes(limitFromURL) ? limitFromURL : 10
   );
 
-  const requestId = useRef(0);
+  // User typing थांबवल्यावर 400ms ने search सुरू होईल.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search.trim());
+      setPage(1);
+    }, 400);
 
- 
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  // URL मध्ये page, limit, search, category आणि sort ठेवतो.
+  useEffect(() => {
+    const params = new URLSearchParams();
+
+    params.set("page", String(page));
+    params.set("limit", String(limit));
+
+    if (debouncedSearch) {
+      params.set("search", debouncedSearch);
+    }
+
+    if (category) {
+      params.set("category", category);
+    }
+
+    if (sort) {
+      params.set("sort", sort);
+      params.set("order", order);
+    }
+
+    router.replace(`/products?${params.toString()}`);
+  }, [
+    page,
+    limit,
+    debouncedSearch,
+    category,
+    sort,
+    order,
+    router,
+  ]);
+
+  // Login तपासतो आणि categories load करतो.
   useEffect(() => {
     const token = localStorage.getItem("token");
 
@@ -70,266 +105,126 @@ export default function ProductsPage() {
       return;
     }
 
-    loadCategories();
-  }, []);
+    getCategories()
+      .then((data) => setCategories(data || []))
+      .catch(() => setCategories([]));
+  }, [router]);
 
-  
+  // Products load करतो. जुन्या request चे results दुर्लक्ष होतात.
   useEffect(() => {
     const token = localStorage.getItem("token");
 
     if (!token) return;
 
-    loadProducts();
-  }, [page, limit, search, category, sort, order]);
-
-
-  const loadCategories = async () => {
-    try {
-      const data = await getCategories();
-      setCategories(data);
-    } catch (error) {
-      console.log(error);
-    }
-  };
-
- 
-  const loadProducts = async () => {
+    let active = true;
     const currentRequest = ++requestId.current;
 
-    setLoading(true);
-    setError("");
+    async function loadProducts() {
+      setLoading(true);
+      setError("");
 
-    try {
-      let data;
-      let result = [];
+      try {
+        let data;
+        let result = [];
+        let resultTotal = 0;
 
-      
-      if (search.trim()) {
-        data = await searchProducts(
-          search.trim(),
-          0,
-          0
-        );
+        if (debouncedSearch) {
+          data = await searchProducts(debouncedSearch, 0, 0);
+          result = data.products || [];
 
-        result = data.products || [];
+          if (category) {
+            result = result.filter(
+              (product) => product.category === category
+            );
+          }
 
-      
-        if (category) {
-          result = result.filter(
-            (product) =>
-              product.category === category
+          if (sort) {
+            result.sort((a, b) => {
+              let first = a[sort];
+              let second = b[sort];
+
+              if (sort === "title") {
+                first = first.toLowerCase();
+                second = second.toLowerCase();
+              }
+
+              if (first < second) return order === "asc" ? -1 : 1;
+              if (first > second) return order === "asc" ? 1 : -1;
+              return 0;
+            });
+          }
+
+          resultTotal = result.length;
+
+          const start = (page - 1) * limit;
+          result = result.slice(start, start + limit);
+        } else if (category) {
+          data = await getProductsByCategory(
+            category,
+            limit,
+            (page - 1) * limit
           );
+
+          result = data.products || [];
+          resultTotal = data.total || 0;
+        } else {
+          data = await getProducts(limit, (page - 1) * limit);
+
+          result = data.products || [];
+          resultTotal = data.total || 0;
         }
 
-       
-        if (sort) {
-          result.sort((a, b) => {
-            let first = a[sort];
-            let second = b[sort];
+        // Request सुरू झाल्यानंतर नवीन request असेल तर जुना result दाखवू नको.
+        if (!active || currentRequest !== requestId.current) return;
 
-            if (sort === "title") {
-              first = first.toLowerCase();
-              second = second.toLowerCase();
-            }
+        setProducts(result);
+        setTotal(resultTotal);
+      } catch (err) {
+        if (!active || currentRequest !== requestId.current) return;
 
-            if (first < second) {
-              return order === "asc" ? -1 : 1;
-            }
-
-            if (first > second) {
-              return order === "asc" ? 1 : -1;
-            }
-
-            return 0;
-          });
-        }
-
-       
-        const start = (page - 1) * limit;
-        const end = start + limit;
-
-        result = result.slice(start, end);
-      }
-
-     
-      else if (category) {
-        data = await getProductsByCategory(
-          category,
-          limit,
-          (page - 1) * limit
+        setError(
+          err?.response?.data?.message ||
+            err?.message ||
+            "Failed to load products."
         );
-
-        result = data.products || [];
-
-      
-        if (sort) {
-          result.sort((a, b) => {
-            let first = a[sort];
-            let second = b[sort];
-
-            if (sort === "title") {
-              first = first.toLowerCase();
-              second = second.toLowerCase();
-            }
-
-            if (first < second) {
-              return order === "asc" ? -1 : 1;
-            }
-
-            if (first > second) {
-              return order === "asc" ? 1 : -1;
-            }
-
-            return 0;
-          });
+      } finally {
+        if (active && currentRequest === requestId.current) {
+          setLoading(false);
         }
       }
-
-      
-      else {
-        data = await getProducts(
-          limit,
-          (page - 1) * limit
-        );
-
-        result = data.products || [];
-
-        if (sort) {
-          result.sort((a, b) => {
-            let first = a[sort];
-            let second = b[sort];
-
-            if (sort === "title") {
-              first = first.toLowerCase();
-              second = second.toLowerCase();
-            }
-
-            if (first < second) {
-              return order === "asc" ? -1 : 1;
-            }
-
-            if (first > second) {
-              return order === "asc" ? 1 : -1;
-            }
-
-            return 0;
-          });
-        }
-      }
-
-      if (currentRequest !== requestId.current) {
-        return;
-      }
-
-      setProducts(result);
-
-    } catch (error) {
-      if (currentRequest !== requestId.current) {
-        return;
-      }
-
-      setError(
-        error.response?.data?.message ||
-          "Failed to load products"
-      );
-
-    } finally {
-      if (currentRequest === requestId.current) {
-        setLoading(false);
-      }
-    }
-  };
-
-  const updateURL = (values = {}) => {
-    const params = new URLSearchParams();
-
-    const newPage = values.page ?? page;
-    const newLimit = values.limit ?? limit;
-    const newSearch = values.search ?? search;
-    const newCategory = values.category ?? category;
-    const newSort = values.sort ?? sort;
-    const newOrder = values.order ?? order;
-
-    params.set("page", newPage);
-    params.set("limit", newLimit);
-
-    if (newSearch) {
-      params.set("search", newSearch);
     }
 
-    if (newCategory) {
-      params.set("category", newCategory);
-    }
+    loadProducts();
 
-    if (newSort) {
-      params.set("sort", newSort);
-      params.set("order", newOrder);
-    }
+    return () => {
+      active = false;
+    };
+  }, [
+    page,
+    limit,
+    debouncedSearch,
+    category,
+    sort,
+    order,
+    retry,
+  ]);
 
-    router.push(
-      `/products?${params.toString()}`
-    );
-  };
-
-  const handleSearch = (value) => {
-    setSearch(value);
-    setPage(1);
-
-    updateURL({
-      search: value,
-      page: 1,
-    });
-  };
-
-  const handleCategory = (value) => {
+  function handleCategory(value) {
     setCategory(value);
     setPage(1);
+  }
 
-    updateURL({
-      category: value,
-      page: 1,
-    });
-  };
-
-  const handleSort = (value) => {
+  function handleSort(value) {
     setSort(value);
     setPage(1);
+  }
 
-    updateURL({
-      sort: value,
-      page: 1,
-    });
-  };
-
-  const handleOrder = (value) => {
-    setOrder(value);
-
-    updateURL({
-      order: value,
-    });
-  };
-
-  const handlePage = (newPage) => {
-    if (newPage < 1) return;
-
-    setPage(newPage);
-
-    updateURL({
-      page: newPage,
-    });
-  };
-
-  const handleLimit = (newLimit) => {
-    setLimit(newLimit);
+  function handleLimit(value) {
+    setLimit(Number(value));
     setPage(1);
+  }
 
-    updateURL({
-      limit: newLimit,
-      page: 1,
-    });
-  };
-
-  const handleDelete = async (id) => {
+  async function handleDelete(id) {
     const confirmed = window.confirm(
       "Are you sure you want to delete this product?"
     );
@@ -338,35 +233,26 @@ export default function ProductsPage() {
 
     try {
       await deleteProduct(id);
-
       setProducts((current) =>
-        current.filter(
-          (product) => product.id !== id
-        )
+        current.filter((product) => product.id !== id)
       );
-
-    } catch (error) {
-      alert("Failed to delete product");
+      setTotal((current) => Math.max(0, current - 1));
+    } catch (err) {
+      window.alert(
+        err?.message || "Failed to delete product."
+      );
     }
-  };
+  }
 
   return (
     <div className="min-h-screen bg-gray-100">
-
       <Navbar />
 
       <main className="mx-auto max-w-7xl p-4 md:p-6">
-
         <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-
           <div>
-            <h1 className="text-3xl font-bold">
-              Products
-            </h1>
-
-            <p className="text-gray-500">
-              Manage your products
-            </p>
+            <h1 className="text-3xl font-bold">Products</h1>
+            <p className="text-gray-500">Manage your products</p>
           </div>
 
           <Link
@@ -375,137 +261,119 @@ export default function ProductsPage() {
           >
             + Add Product
           </Link>
-
         </div>
 
         <div className="mb-6 grid gap-3 rounded-xl bg-white p-4 shadow md:grid-cols-4">
-
           <input
             type="text"
             placeholder="Search products..."
             value={search}
-            onChange={(e) =>
-              handleSearch(e.target.value)
-            }
+            onChange={(event) => setSearch(event.target.value)}
             className="rounded-lg border p-3"
           />
 
           <select
             value={category}
-            onChange={(e) =>
-              handleCategory(e.target.value)
-            }
+            onChange={(event) => handleCategory(event.target.value)}
             className="rounded-lg border p-3"
           >
-            <option value="">
-              All Categories
-            </option>
+            <option value="">All Categories</option>
 
             {categories.map((item) => (
               <option
-                key={item.slug}
-                value={item.slug}
+                key={item.slug || item}
+                value={item.slug || item}
               >
-                {item.name}
+                {item.name || item}
               </option>
             ))}
           </select>
 
           <select
             value={sort}
-            onChange={(e) =>
-              handleSort(e.target.value)
-            }
+            onChange={(event) => handleSort(event.target.value)}
             className="rounded-lg border p-3"
           >
-            <option value="">
-              Sort By
-            </option>
-
-            <option value="price">
-              Price
-            </option>
-
-            <option value="rating">
-              Rating
-            </option>
-
-            <option value="title">
-              Title
-            </option>
+            <option value="">Sort By</option>
+            <option value="price">Price</option>
+            <option value="rating">Rating</option>
+            <option value="title">Title</option>
           </select>
 
           <select
             value={order}
-            onChange={(e) =>
-              handleOrder(e.target.value)
-            }
+            onChange={(event) => {
+              setOrder(event.target.value);
+              setPage(1);
+            }}
             className="rounded-lg border p-3"
           >
-            <option value="asc">
-              Ascending
-            </option>
-
-            <option value="desc">
-              Descending
-            </option>
+            <option value="asc">Ascending</option>
+            <option value="desc">Descending</option>
           </select>
 
+          <select
+            value={limit}
+            onChange={(event) => handleLimit(event.target.value)}
+            className="rounded-lg border p-3"
+          >
+            <option value={10}>10 per page</option>
+            <option value={20}>20 per page</option>
+            <option value={50}>50 per page</option>
+          </select>
         </div>
 
         {loading && <Loader />}
 
         {!loading && error && (
           <div className="rounded-lg bg-white p-8 text-center shadow">
-
-            <p className="mb-4 text-red-600">
-              {error}
-            </p>
+            <p className="mb-4 text-red-600">{error}</p>
 
             <button
-              onClick={loadProducts}
+              onClick={() => setRetry((value) => value + 1)}
               className="rounded-lg bg-blue-600 px-5 py-2 text-white"
             >
               Retry
             </button>
-
           </div>
         )}
 
-        {!loading &&
-          !error &&
-          products.length === 0 && (
-            <div className="rounded-lg bg-white p-10 text-center shadow">
-              No products found.
-            </div>
-          )}
+        {!loading && !error && products.length === 0 && (
+          <div className="rounded-lg bg-white p-10 text-center shadow">
+            No products found.
+          </div>
+        )}
 
-        {!loading &&
-          !error &&
-          products.length > 0 && (
-            <>
-              <ProductTable
-                products={products}
-                onDelete={handleDelete}
-              />
+        {!loading && !error && products.length > 0 && (
+          <>
+            <ProductTable
+              products={products}
+              onDelete={handleDelete}
+            />
 
-              <ProductCard
-                products={products}
-                onDelete={handleDelete}
-              />
+            <ProductCard
+              products={products}
+              onDelete={handleDelete}
+            />
 
-              <Pagination
-                page={page}
-                total={194}
-                limit={limit}
-                onPageChange={handlePage}
-                onLimitChange={handleLimit}
-              />
-            </>
-          )}
-
+            <Pagination
+              page={page}
+              total={total}
+              limit={limit}
+              onPageChange={setPage}
+              onLimitChange={handleLimit}
+            />
+          </>
+        )}
       </main>
-
     </div>
+  );
+}
+
+export default function ProductsPage() {
+  return (
+    <Suspense fallback={<p className="p-8 text-center">Loading products...</p>}>
+      <ProductsPageContent />
+    </Suspense>
   );
 }
